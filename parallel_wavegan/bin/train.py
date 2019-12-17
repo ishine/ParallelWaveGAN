@@ -9,6 +9,7 @@
 import argparse
 import logging
 import os
+import sys
 
 from collections import defaultdict
 
@@ -21,6 +22,8 @@ import yaml
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+import parallel_wavegan
 
 from parallel_wavegan.datasets import AudioMelDataset
 from parallel_wavegan.losses import MultiResolutionSTFTLoss
@@ -99,10 +102,6 @@ class Trainer(object):
 
         """
         state_dict = {
-            "model": {
-                "generator": self.model["generator"].state_dict(),
-                "discriminator": self.model["discriminator"].state_dict(),
-            },
             "optimizer": {
                 "generator": self.optimizer["generator"].state_dict(),
                 "discriminator": self.optimizer["discriminator"].state_dict(),
@@ -114,6 +113,17 @@ class Trainer(object):
             "steps": self.steps,
             "epochs": self.epochs,
         }
+        if self.config["distributed"]:
+            state_dict["model"] = {
+                "generator": self.model["generator"].module.state_dict(),
+                "discriminator": self.model["discriminator"].module.state_dict(),
+            }
+        else:
+            state_dict["model"] = {
+                "generator": self.model["generator"].state_dict(),
+                "discriminator": self.model["discriminator"].state_dict(),
+            }
+
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
@@ -125,11 +135,15 @@ class Trainer(object):
             checkpoint_path (str): Checkpoint path to be loaded.
 
         """
-        state_dict = torch.load(checkpoint_path)
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
         self.steps = state_dict["steps"]
         self.epochs = state_dict["epochs"]
-        self.model["generator"].load_state_dict(state_dict["model"]["generator"])
-        self.model["discriminator"].load_state_dict(state_dict["model"]["discriminator"])
+        if self.config["distributed"]:
+            self.model["generator"].module.load_state_dict(state_dict["model"]["generator"])
+            self.model["discriminator"].module.load_state_dict(state_dict["model"]["discriminator"])
+        else:
+            self.model["generator"].load_state_dict(state_dict["model"]["generator"])
+            self.model["discriminator"].load_state_dict(state_dict["model"]["discriminator"])
         self.optimizer["generator"].load_state_dict(state_dict["optimizer"]["generator"])
         self.optimizer["discriminator"].load_state_dict(state_dict["optimizer"]["discriminator"])
         self.scheduler["generator"].load_state_dict(state_dict["scheduler"]["generator"])
@@ -139,9 +153,9 @@ class Trainer(object):
         """Train model one step."""
         # parse batch
         batch = [b.to(self.device) for b in batch]
-        z, c, y, _ = batch
+        z, c, y = batch
 
-        # calculate loss for generator
+        # calculate generator loss
         y_ = self.model["generator"](z, c)
         y, y_ = y.squeeze(1), y_.squeeze(1)
         sc_loss, mag_loss = self.criterion["stft"](y_, y)
@@ -189,6 +203,7 @@ class Trainer(object):
         # update counts
         self.steps += 1
         self.tqdm.update(1)
+        self._check_train_finish()
 
     def _train_epoch(self):
         """Train model one epoch."""
@@ -197,10 +212,10 @@ class Trainer(object):
             self._train_step(batch)
 
             # check interval
-            self._check_log_interval()
-            self._check_eval_interval()
-            self._check_save_interval()
-            self._check_train_finish()
+            if self.config["rank"] == 0:
+                self._check_log_interval()
+                self._check_eval_interval()
+                self._check_save_interval()
 
             # check whether training is finished
             if self.finish_train:
@@ -216,7 +231,7 @@ class Trainer(object):
         """Evaluate model one step."""
         # parse batch
         batch = [b.to(self.device) for b in batch]
-        z, c, y, _ = batch
+        z, c, y = batch
 
         # calculate generator loss
         y_ = self.model["generator"](z, c)
@@ -227,7 +242,7 @@ class Trainer(object):
         aux_loss = sc_loss + mag_loss
         gen_loss = aux_loss + self.config["lambda_adv"] * adv_loss
 
-        # train discriminator
+        # calculate discriminator loss
         p = self.model["discriminator"](y.unsqueeze(1)).squeeze(1)
         p_ = self.model["discriminator"](y_.unsqueeze(1)).squeeze(1)
         real_loss = self.criterion["mse"](p, p.new_ones(p.size()))
@@ -286,7 +301,7 @@ class Trainer(object):
         # generate
         with torch.no_grad():
             batch = [b.to(self.device) for b in batch]
-            z_batch, c_batch, y_batch, _ = batch
+            z_batch, c_batch, y_batch = batch
             y_batch_ = self.model["generator"](z_batch, c_batch)
 
         # check directory
@@ -330,7 +345,7 @@ class Trainer(object):
         if self.steps % self.config["save_interval_steps"] == 0:
             self.save_checkpoint(
                 os.path.join(self.config["outdir"], f"checkpoint-{self.steps}steps.pkl"))
-            logging.info(f"saved checkpoint @ {self.steps} steps.")
+            logging.info(f"successfully saved checkpoint @ {self.steps} steps.")
 
     def _check_eval_interval(self):
         if self.steps % self.config["eval_interval_steps"] == 0:
@@ -385,57 +400,42 @@ class Collater(object):
             Tensor: Gaussian noise batch (B, 1, T).
             Tensor: Auxiliary feature batch (B, C, T'), where T = (T' - 2 * aux_context_window) * hop_size
             Tensor: Target signal batch (B, 1, T).
-            LongTensor: Input length batch (B,)
 
         """
-        # Time resolution adjustment
-        new_batch = []
+        # time resolution check
+        y_batch, c_batch = [], []
         for idx in range(len(batch)):
             x, c = batch[idx]
             self._assert_ready_for_upsampling(x, c, self.hop_size, 0)
             if len(c) - 2 * self.aux_context_window > self.batch_max_frames:
+                # randomly pickup with the batch_max_steps length of the part
                 interval_start = self.aux_context_window
                 interval_end = len(c) - self.batch_max_frames - self.aux_context_window
                 start_frame = np.random.randint(interval_start, interval_end)
                 start_step = start_frame * self.hop_size
-                x = x[start_step: start_step + self.batch_max_steps]
+                y = x[start_step: start_step + self.batch_max_steps]
                 c = c[start_frame - self.aux_context_window:
                       start_frame + self.aux_context_window + self.batch_max_frames]
-                self._assert_ready_for_upsampling(x, c, self.hop_size, self.aux_context_window)
+                self._assert_ready_for_upsampling(y, c, self.hop_size, self.aux_context_window)
             else:
                 logging.warn(f"removed short sample from batch (length={len(x)}).")
                 continue
-            new_batch.append((x, c))
-        batch = new_batch
+            y_batch += [y.astype(np.float32).reshape(-1, 1)]  # [(T, 1), (T, 1), ...]
+            c_batch += [c.astype(np.float32)]  # [(T' C), (T' C), ...]
 
-        # Make padded target signal batch
-        xlens = [len(b[0]) for b in batch]
-        max_olen = max(xlens)
-        y_batch = np.array([self._pad_2darray(b[0].reshape(-1, 1), max_olen) for b in batch], dtype=np.float32)
-        y_batch = torch.FloatTensor(y_batch).transpose(2, 1)
+        # convert each batch to tensor, asuume that each item in batch has the same length
+        y_batch = torch.FloatTensor(np.array(y_batch)).transpose(2, 1)  # (B, 1, T)
+        c_batch = torch.FloatTensor(np.array(c_batch)).transpose(2, 1)  # (B, C, T')
 
-        # Make padded conditional auxiliary feature batch
-        clens = [len(b[1]) for b in batch]
-        max_clen = max(clens)
-        c_batch = np.array([self._pad_2darray(b[1], max_clen) for b in batch], dtype=np.float32)
-        c_batch = torch.FloatTensor(c_batch).transpose(2, 1)
+        # make input noise signal batch tensor
+        z_batch = torch.randn(y_batch.size())  # (B, 1, T)
 
-        # Make input noise signal batch
-        z_batch = torch.randn(y_batch.size())
-
-        # Make the list of the length of input signals
-        input_lengths = torch.LongTensor(xlens)
-
-        return z_batch, c_batch, y_batch, input_lengths
+        return z_batch, c_batch, y_batch
 
     @staticmethod
     def _assert_ready_for_upsampling(x, c, hop_size, context_window):
+        """Assert the audio and feature lengths are correctly adjusted for upsamping."""
         assert len(x) == (len(c) - 2 * context_window) * hop_size
-
-    @staticmethod
-    def _pad_2darray(x, max_len, b_pad=0, constant_values=0):
-        return np.pad(x, [(b_pad, max_len - len(x) - b_pad), (0, 0)],
-                      mode="constant", constant_values=constant_values)
 
 
 def main():
@@ -443,7 +443,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train Parallel WaveGAN (See detail in parallel_wavegan/bin/train.py).")
     parser.add_argument("--train-dumpdir", type=str, required=True,
-                        help="directory including trainning data.")
+                        help="directory including training data.")
     parser.add_argument("--dev-dumpdir", type=str, required=True,
                         help="directory including development data.")
     parser.add_argument("--outdir", type=str, required=True,
@@ -454,19 +454,45 @@ def main():
                         help="checkpoint file path to resume training. (default=\"\")")
     parser.add_argument("--verbose", type=int, default=1,
                         help="logging level. higher is more logging. (default=1)")
+    parser.add_argument("--rank", "--local_rank", default=0, type=int,
+                        help="rank for distributed training. no need to explictly specify.")
     args = parser.parse_args()
+
+    args.distributed = False
+    if not torch.cuda.is_available():
+        device = torch.device("cpu")
+    else:
+        device = torch.device("cuda")
+        # effective when using fixed size inputs
+        # see https://discuss.pytorch.org/t/what-does-torch-backends-cudnn-benchmark-do/5936
+        torch.backends.cudnn.benchmark = True
+        torch.cuda.set_device(args.rank)
+        # setup for distributed training
+        # see example: https://github.com/NVIDIA/apex/tree/master/examples/simple/distributed
+        if "WORLD_SIZE" in os.environ:
+            args.world_size = int(os.environ["WORLD_SIZE"])
+            args.distributed = args.world_size > 1
+        if args.distributed:
+            torch.distributed.init_process_group(backend="nccl", init_method="env://")
+
+    # suppress logging for distributed training
+    if args.rank != 0:
+        sys.stdout = open(os.devnull, "w")
 
     # set logger
     if args.verbose > 1:
         logging.basicConfig(
-            level=logging.DEBUG, format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
+            level=logging.DEBUG, stream=sys.stdout,
+            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
     elif args.verbose > 0:
         logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
+            level=logging.INFO, stream=sys.stdout,
+            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
     else:
         logging.basicConfig(
-            level=logging.WARN, format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
-        logging.warning('skip DEBUG/INFO messages')
+            level=logging.WARN, stream=sys.stdout,
+            format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s")
+        logging.warning("skip DEBUG/INFO messages")
 
     # check directory existence
     if not os.path.exists(args.outdir):
@@ -476,6 +502,7 @@ def main():
     with open(args.config) as f:
         config = yaml.load(f, Loader=yaml.Loader)
     config.update(vars(args))
+    config["version"] = parallel_wavegan.__version__  # add version info
     with open(os.path.join(args.outdir, "config.yml"), "w") as f:
         yaml.dump(config, f, Dumper=yaml.Dumper)
     for key, value in config.items():
@@ -505,40 +532,53 @@ def main():
             audio_load_fn=audio_load_fn,
             mel_load_fn=mel_load_fn,
             mel_length_threshold=mel_length_threshold,
-        ),
+            allow_cache=config.get("allow_cache", False)),  # keep compatibility
         "dev": AudioMelDataset(
             root_dir=args.dev_dumpdir,
             audio_query=audio_query,
             mel_query=mel_query,
             audio_load_fn=audio_load_fn,
             mel_load_fn=mel_load_fn,
-            mel_length_threshold=mel_length_threshold),
+            mel_length_threshold=mel_length_threshold,
+            allow_cache=config.get("allow_cache", False)),  # keep compatibility
     }
 
     # get data loader
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
     collater = Collater(
         batch_max_steps=config["batch_max_steps"],
         hop_size=config["hop_size"],
         aux_context_window=config["generator_params"]["aux_context_window"],
     )
+    train_sampler, dev_sampler = None, None
+    if args.distributed:
+        # setup sampler for distributed training
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(
+            dataset=dataset["train"],
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=True)
+        dev_sampler = DistributedSampler(
+            dataset=dataset["dev"],
+            num_replicas=args.world_size,
+            rank=args.rank,
+            shuffle=False)
     data_loader = {
         "train": DataLoader(
             dataset=dataset["train"],
-            shuffle=True,
+            shuffle=False if args.distributed else True,
             collate_fn=collater,
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
+            sampler=train_sampler,
             pin_memory=config["pin_memory"]),
         "dev": DataLoader(
             dataset=dataset["dev"],
-            shuffle=True,
+            shuffle=False if args.distributed else True,
             collate_fn=collater,
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
+            sampler=dev_sampler,
             pin_memory=config["pin_memory"]),
     }
 
@@ -570,6 +610,14 @@ def main():
             optimizer=optimizer["discriminator"],
             **config["discriminator_scheduler_params"]),
     }
+    if args.distributed:
+        # wrap model for distributed training
+        try:
+            from apex.parallel import DistributedDataParallel
+        except ImportError:
+            raise ImportError("apex is not installed. please check https://github.com/NVIDIA/apex.")
+        model["generator"] = DistributedDataParallel(model["generator"])
+        model["discriminator"] = DistributedDataParallel(model["discriminator"])
     logging.info(model["generator"])
     logging.info(model["discriminator"])
 
@@ -589,12 +637,12 @@ def main():
     # resume from checkpoint
     if len(args.resume) != 0:
         trainer.load_checkpoint(args.resume)
-        logging.info(f"resumed from {args.resume}.")
+        logging.info(f"successfully resumed from {args.resume}.")
 
     # run training loop
     try:
         trainer.run()
-    finally:
+    except KeyboardInterrupt:
         trainer.save_checkpoint(
             os.path.join(config["outdir"], f"checkpoint-{trainer.steps}steps.pkl"))
         logging.info(f"successfully saved checkpoint @ {trainer.steps}steps.")

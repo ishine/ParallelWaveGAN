@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""Setup Parallel WaveGAN libarary."""
+
 import os
 import pip
 import sys
@@ -11,7 +13,7 @@ from setuptools import setup
 
 if LooseVersion(sys.version) < LooseVersion("3.6"):
     raise RuntimeError(
-        "ESPnet requires Python>=3.6, "
+        "parallel-wavegan requires Python>=3.6, "
         "but your Python is {}".format(sys.version))
 if LooseVersion(pip.__version__) < LooseVersion("19"):
     raise RuntimeError(
@@ -20,7 +22,7 @@ if LooseVersion(pip.__version__) < LooseVersion("19"):
 
 requirements = {
     "install": [
-        "torch>=1.0.1,<=1.3",
+        "torch>=1.0.1",
         "setuptools>=38.5.1",
         "librosa>=0.7.0",
         "soundfile>=0.10.2",
@@ -60,7 +62,7 @@ extras_require = {k: v for k, v in requirements.items()
 
 dirname = os.path.dirname(__file__)
 setup(name="parallel_wavegan",
-      version="0.2.2",
+      version="0.2.5.post2",
       url="http://github.com/kan-bayashi/ParallelWaveGAN",
       author="Tomoki Hayashi",
       author_email="hayashi.tomoki@g.sp.m.is.nagoya-u.ac.jp",
@@ -76,7 +78,8 @@ setup(name="parallel_wavegan",
       extras_require=extras_require,
       entry_points=entry_points,
       classifiers=[
-          "Programming Language :: Python :: 3",
+          "Programming Language :: Python :: 3.6",
+          "Programming Language :: Python :: 3.7",
           "Intended Audience :: Science/Research",
           "Operating System :: POSIX :: Linux",
           "License :: OSI Approved :: MIT License",
