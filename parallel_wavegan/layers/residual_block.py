@@ -46,7 +46,6 @@ class ResidualBlock(torch.nn.Module):
                  skip_channels=64,
                  aux_channels=80,
                  dropout=0.0,
-                 padding=None,
                  dilation=1,
                  bias=True,
                  use_causal_conv=False
@@ -59,8 +58,6 @@ class ResidualBlock(torch.nn.Module):
             skip_channels (int): Number of channels for skip connection.
             aux_channels (int): Local conditioning channels i.e. auxiliary input dimension.
             dropout (float): Dropout probability.
-            padding (int): Padding for convolution layers. If None, proper padding is
-                computed depends on dilation and kernel_size.
             dilation (int): Dilation factor.
             bias (bool): Whether to add bias parameter in convolution layers.
             use_causal_conv (bool): Whether to use use_causal_conv or non-use_causal_conv convolution.
@@ -68,13 +65,12 @@ class ResidualBlock(torch.nn.Module):
         """
         super(ResidualBlock, self).__init__()
         self.dropout = dropout
-        if padding is None:
-            # no future time stamps available
-            if use_causal_conv:
-                padding = (kernel_size - 1) * dilation
-            else:
-                assert (kernel_size - 1) % 2 == 0, "Not support even number kernel size."
-                padding = (kernel_size - 1) // 2 * dilation
+        # no future time stamps available
+        if use_causal_conv:
+            padding = (kernel_size - 1) * dilation
+        else:
+            assert (kernel_size - 1) % 2 == 0, "Not support even number kernel size."
+            padding = (kernel_size - 1) // 2 * dilation
         self.use_causal_conv = use_causal_conv
 
         # dilation conv
@@ -124,10 +120,10 @@ class ResidualBlock(torch.nn.Module):
 
         x = torch.tanh(xa) * torch.sigmoid(xb)
 
-        # For skip connection
+        # for skip connection
         s = self.conv1x1_skip(x)
 
-        # For residual connection
+        # for residual connection
         x = (self.conv1x1_out(x) + residual) * math.sqrt(0.5)
 
         return x, s

@@ -7,32 +7,35 @@
 . ./path.sh || exit 1;
 
 # basic settings
-stage=-1
-stop_stage=100
-n_gpus=1
-n_jobs=16
-verbose=1
+stage=-1       # stage to start
+stop_stage=100 # stage to stop
+verbose=1      # verbosity level (lower is less info)
+n_gpus=1       # number of gpus in training
+n_jobs=16      # number of parallel jobs in feature extraction
 
 # NOTE(kan-bayashi): renamed to conf to avoid conflict in parse_options.sh
 conf=conf/parallel_wavegan.v1.yaml
 
 # directory path setting
-download_dir=downloads
-dumpdir=dump
+download_dir=downloads # direcotry to save downloaded files
+dumpdir=dump           # directory to dump features
 
 # training related setting
-tag=""
-resume=""
+tag=""     # tag for directory to save model
+resume=""  # checkpoint path to resume training
+           # (e.g. <path>/<to>/checkpoint-10000steps.pkl)
 
 # decoding related setting
-checkpoint=""
+checkpoint="" # checkpoint path to be used for decoding
+              # if not provided, the latest one will be used
+              # (e.g. <path>/<to>/checkpoint-400000steps.pkl)
 
 # shellcheck disable=SC1091
 . parse_options.sh || exit 1;
 
-train_set="train_nodev"
-dev_set="dev"
-eval_set="eval"
+train_set="train_nodev" # name of training data directory
+dev_set="dev"           # name of development data direcotry
+eval_set="eval"         # name of evaluation data direcotry
 
 set -euo pipefail
 
@@ -50,6 +53,7 @@ if [ "${stage}" -le 0 ] && [ "${stop_stage}" -ge 0 ]; then
         "${download_dir}/LJSpeech-1.1" data
 fi
 
+stats_ext=$(grep -q "hdf5" <(yq ".format" "${conf}") && echo "h5" || echo "npy")
 if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
     echo "Stage 1: Feature extraction"
     # extract raw features
@@ -92,7 +96,7 @@ if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
         ${train_cmd} --num-threads "${n_jobs}" "${dumpdir}/${name}/norm/normalize.log" \
             parallel-wavegan-normalize \
                 --config "${conf}" \
-                --stats "${dumpdir}/${train_set}/stats.h5" \
+                --stats "${dumpdir}/${train_set}/stats.${stats_ext}" \
                 --rootdir "${dumpdir}/${name}/raw" \
                 --dumpdir "${dumpdir}/${name}/norm" \
                 --n_jobs "${n_jobs}" \
@@ -114,7 +118,7 @@ fi
 if [ "${stage}" -le 2 ] && [ "${stop_stage}" -ge 2 ]; then
     echo "Stage 2: Network training"
     [ ! -e "${expdir}" ] && mkdir -p "${expdir}"
-    cp "${dumpdir}/${train_set}/stats.h5" "${expdir}"
+    cp "${dumpdir}/${train_set}/stats.${stats_ext}" "${expdir}"
     if [ "${n_gpus}" -gt 1 ]; then
         train="python -m parallel_wavegan.distributed.launch --nproc_per_node ${n_gpus} -c parallel-wavegan-train"
     else

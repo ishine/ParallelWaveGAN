@@ -19,6 +19,7 @@ eval_set="eval"
 db_root=$1
 data_dir=$2
 
+# check arguments
 if [ $# != 2 ]; then
     echo "Usage: $0 [Options] <db_root> <data_dir>"
     echo "e.g.: $0 downloads/jsut_ver1.1 data"
@@ -32,10 +33,9 @@ if [ $# != 2 ]; then
     exit 1
 fi
 
-# make dirs
-for name in all "${train_set}" "${dev_set}" "${eval_set}"; do
-    [ ! -e "${data_dir}/${name}" ] && mkdir -p "${data_dir}/${name}"
-done
+set -euo pipefail
+
+[ ! -e "${data_dir}/all" ] && mkdir -p "${data_dir}/all"
 
 # set filenames
 scp="${data_dir}/all/wav.scp"
@@ -52,7 +52,7 @@ find "${db_root}" -follow -name "*.wav" | sort | while read -r filename; do
 done
 
 # make segments
-find "${db_root}" -name "*.lab" -follow | sort | while read -r filename;do
+find "${db_root}" -name "*.lab" -follow | sort | while read -r filename; do
     id=$(basename "${filename}" | sed -e "s/\.[^\.]*$//g")
     start_nsec=$(head -n 1 "${filename}" | cut -d " " -f 2)
     end_nsec=$(tail -n 1 "${filename}" | cut -d " " -f 1)
@@ -61,18 +61,28 @@ find "${db_root}" -name "*.lab" -follow | sort | while read -r filename;do
     echo "${id} ${id} ${start_sec} ${end_sec}" >> "${segments}"
 done
 
+# check
+diff -q <(awk '{print $1}' "${scp}") <(awk '{print $1}' "${segments}") > /dev/null
+
 # split
 num_all=$(wc -l < "${scp}")
 num_deveval=$((num_dev + num_eval))
 num_train=$((num_all - num_deveval))
-tail -n "${num_train}" "${scp}" > "${data_dir}/${train_set}/wav.scp"
-head -n "${num_deveval}" "${scp}" | tail -n "${num_dev}" > "${data_dir}/${dev_set}/wav.scp"
-head -n "${num_deveval}" "${scp}" | head -n "${num_eval}" > "${data_dir}/${eval_set}/wav.scp"
-tail -n "${num_train}" "${segments}" > "${data_dir}/${train_set}/segments"
-head -n "${num_deveval}" "${segments}" | tail -n "${num_dev}" > "${data_dir}/${dev_set}/segments"
-head -n "${num_deveval}" "${segments}" | head -n "${num_eval}" > "${data_dir}/${eval_set}/segments"
+split_data.sh \
+    --num_first "${num_train}" \
+    --num_second "${num_deveval}" \
+    "${data_dir}/all" \
+    "${data_dir}/${train_set}" \
+    "${data_dir}/deveval"
+split_data.sh \
+    --num_first "${num_dev}" \
+    --num_second "${num_eval}" \
+    "${data_dir}/deveval" \
+    "${data_dir}/${dev_set}" \
+    "${data_dir}/${eval_set}"
 
-# remove all
+# remove tmp directories
 rm -rf "${data_dir}/all"
+rm -rf "${data_dir}/deveval"
 
 echo "Successfully prepared data."

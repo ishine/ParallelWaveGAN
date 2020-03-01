@@ -10,18 +10,15 @@
 stage=-1       # stage to start
 stop_stage=100 # stage to stop
 verbose=1      # verbosity level (lower is less info)
-n_gpus=1       # number of gpus in training
-n_jobs=16      # number of parallel jobs in feature extraction
+n_gpus=0       # number of gpus in training
+n_jobs=2       # number of parallel jobs in feature extraction
 
 # NOTE(kan-bayashi): renamed to conf to avoid conflict in parse_options.sh
-conf=conf/parallel_wavegan.v1.yaml
+conf=conf/parallel_wavegan.v1.debug.yaml
 
 # directory path setting
 download_dir=downloads # direcotry to save downloaded files
 dumpdir=dump           # directory to dump features
-
-# target speaker setting
-spk=slt # you can select from slt, clb, bdl, rms, awb, jmk, ksp
 
 # training related setting
 tag=""     # tag for directory to save model
@@ -36,15 +33,15 @@ checkpoint="" # checkpoint path to be used for decoding
 # shellcheck disable=SC1091
 . parse_options.sh || exit 1;
 
-train_set="train_nodev_${spk}" # name of training data directory
-dev_set="dev_${spk}"           # name of development data direcotry
-eval_set="eval_${spk}"         # name of evaluation data direcotry
+train_set="train_nodev" # name of training data directory
+dev_set="dev"           # name of development data direcotry
+eval_set="eval"         # name of evaluation data direcotry
 
 set -euo pipefail
 
 if [ "${stage}" -le -1 ] && [ "${stop_stage}" -ge -1 ]; then
     echo "Stage -1: Data download"
-    local/data_download.sh "${download_dir}" "${spk}"
+    local/data_download.sh "${download_dir}"
 fi
 
 if [ "${stage}" -le 0 ] && [ "${stop_stage}" -ge 0 ]; then
@@ -53,7 +50,7 @@ if [ "${stage}" -le 0 ] && [ "${stop_stage}" -ge 0 ]; then
         --train_set "${train_set}" \
         --dev_set "${dev_set}" \
         --eval_set "${eval_set}" \
-        "${download_dir}/cmu_us_${spk}_arctic" "${spk}" data
+        "${download_dir}/waves_yesno" data
 fi
 
 stats_ext=$(grep -q "hdf5" <(yq ".format" "${conf}") && echo "h5" || echo "npy")
@@ -69,7 +66,6 @@ if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
             parallel-wavegan-preprocess \
                 --config "${conf}" \
                 --scp "data/${name}/wav.scp" \
-                --segments "data/${name}/segments" \
                 --dumpdir "${dumpdir}/${name}/raw" \
                 --n_jobs "${n_jobs}" \
                 --verbose "${verbose}"
@@ -115,9 +111,9 @@ if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
 fi
 
 if [ -z "${tag}" ]; then
-    expdir="exp/${train_set}_arctic_$(basename "${conf}" .yaml)"
+    expdir="exp/${train_set}_yesno_$(basename "${conf}" .yaml)"
 else
-    expdir="exp/${train_set}_arctic_${tag}"
+    expdir="exp/${train_set}_yesno_${tag}"
 fi
 if [ "${stage}" -le 2 ] && [ "${stop_stage}" -ge 2 ]; then
     echo "Stage 2: Network training"

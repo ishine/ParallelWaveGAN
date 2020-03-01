@@ -24,11 +24,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import parallel_wavegan
+import parallel_wavegan.models
 
 from parallel_wavegan.datasets import AudioMelDataset
 from parallel_wavegan.losses import MultiResolutionSTFTLoss
-from parallel_wavegan.models import ParallelWaveGANDiscriminator
-from parallel_wavegan.models import ParallelWaveGANGenerator
 from parallel_wavegan.optimizers import RAdam
 from parallel_wavegan.utils import read_hdf5
 
@@ -128,43 +127,79 @@ class Trainer(object):
             os.makedirs(os.path.dirname(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
 
-    def load_checkpoint(self, checkpoint_path):
+    def load_checkpoint(self, checkpoint_path, load_only_params=False):
         """Load checkpoint.
 
         Args:
             checkpoint_path (str): Checkpoint path to be loaded.
+            load_only_params (bool): Whether to load only model parameters.
 
         """
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        self.steps = state_dict["steps"]
-        self.epochs = state_dict["epochs"]
         if self.config["distributed"]:
             self.model["generator"].module.load_state_dict(state_dict["model"]["generator"])
             self.model["discriminator"].module.load_state_dict(state_dict["model"]["discriminator"])
         else:
             self.model["generator"].load_state_dict(state_dict["model"]["generator"])
             self.model["discriminator"].load_state_dict(state_dict["model"]["discriminator"])
-        self.optimizer["generator"].load_state_dict(state_dict["optimizer"]["generator"])
-        self.optimizer["discriminator"].load_state_dict(state_dict["optimizer"]["discriminator"])
-        self.scheduler["generator"].load_state_dict(state_dict["scheduler"]["generator"])
-        self.scheduler["discriminator"].load_state_dict(state_dict["scheduler"]["discriminator"])
+        if not load_only_params:
+            self.steps = state_dict["steps"]
+            self.epochs = state_dict["epochs"]
+            self.optimizer["generator"].load_state_dict(state_dict["optimizer"]["generator"])
+            self.optimizer["discriminator"].load_state_dict(state_dict["optimizer"]["discriminator"])
+            # overwrite schedular argument parameters
+            state_dict["scheduler"]["generator"].update(**self.config["generator_scheduler_params"])
+            state_dict["scheduler"]["discriminator"].update(**self.config["discriminator_scheduler_params"])
+            self.scheduler["generator"].load_state_dict(state_dict["scheduler"]["generator"])
+            self.scheduler["discriminator"].load_state_dict(state_dict["scheduler"]["discriminator"])
 
     def _train_step(self, batch):
         """Train model one step."""
         # parse batch
-        batch = [b.to(self.device) for b in batch]
-        z, c, y = batch
+        x, y = batch
+        x = tuple([x_.to(self.device) for x_ in x])
+        y = y.to(self.device)
 
+        #######################
+        #      Generator      #
+        #######################
         # calculate generator loss
-        y_ = self.model["generator"](z, c)
+        y_ = self.model["generator"](*x)
         y, y_ = y.squeeze(1), y_.squeeze(1)
         sc_loss, mag_loss = self.criterion["stft"](y_, y)
         gen_loss = sc_loss + mag_loss
         if self.steps > self.config["discriminator_train_start_steps"]:
-            p_ = self.model["discriminator"](y_.unsqueeze(1)).squeeze(1)
-            adv_loss = self.criterion["mse"](p_, p_.new_ones(p_.size()))
+            # keep compatibility
+            gen_loss *= self.config.get("lambda_aux_after_introduce_adv_loss", 1.0)
+            p_ = self.model["discriminator"](y_.unsqueeze(1))
+            if not isinstance(p_, list):
+                # for standard discriminator
+                adv_loss = self.criterion["mse"](p_, p_.new_ones(p_.size()))
+                self.total_train_loss["train/adversarial_loss"] += adv_loss.item()
+            else:
+                # for multi-scale discriminator
+                adv_loss = 0.0
+                for i in range(len(p_)):
+                    adv_loss += self.criterion["mse"](
+                        p_[i][-1], p_[i][-1].new_ones(p_[i][-1].size()))
+                adv_loss /= (i + 1)
+                self.total_train_loss["train/adversarial_loss"] += adv_loss.item()
+
+                # feature matching loss
+                if self.config["use_feat_match_loss"]:
+                    # no need to track gradients
+                    with torch.no_grad():
+                        p = self.model["discriminator"](y.unsqueeze(1))
+                    fm_loss = 0.0
+                    for i in range(len(p_)):
+                        for j in range(len(p_[i]) - 1):
+                            fm_loss += self.criterion["l1"](p_[i][j], p[i][j].detach())
+                    fm_loss /= (i + 1) * (j + 1)
+                    self.total_train_loss["train/feature_matching_loss"] += fm_loss.item()
+                    adv_loss += self.config["lambda_feat_match"] * fm_loss
+
             gen_loss += self.config["lambda_adv"] * adv_loss
-            self.total_train_loss["train/adversarial_loss"] += adv_loss.item()
+
         self.total_train_loss["train/spectral_convergence_loss"] += sc_loss.item()
         self.total_train_loss["train/log_stft_magnitude_loss"] += mag_loss.item()
         self.total_train_loss["train/generator_loss"] += gen_loss.item()
@@ -179,16 +214,36 @@ class Trainer(object):
         self.optimizer["generator"].step()
         self.scheduler["generator"].step()
 
+        #######################
+        #    Discriminator    #
+        #######################
         if self.steps > self.config["discriminator_train_start_steps"]:
             # calculate discriminator loss
-            p = self.model["discriminator"](y.unsqueeze(1)).squeeze(1)
-            p_ = self.model["discriminator"](y_.unsqueeze(1).detach()).squeeze(1)
-            real_loss = self.criterion["mse"](p, p.new_ones(p.size()))
-            fake_loss = self.criterion["mse"](p_, p_.new_zeros(p_.size()))
-            dis_loss = real_loss + fake_loss
-            self.total_train_loss["train/real_loss"] += real_loss.item()
-            self.total_train_loss["train/fake_loss"] += fake_loss.item()
-            self.total_train_loss["train/discriminator_loss"] += dis_loss.item()
+            p = self.model["discriminator"](y.unsqueeze(1))
+            p_ = self.model["discriminator"](y_.unsqueeze(1).detach())
+            if not isinstance(p, list):
+                # for standard discriminator
+                real_loss = self.criterion["mse"](p, p.new_ones(p.size()))
+                fake_loss = self.criterion["mse"](p_, p_.new_zeros(p_.size()))
+                dis_loss = real_loss + fake_loss
+                self.total_train_loss["train/real_loss"] += real_loss.item()
+                self.total_train_loss["train/fake_loss"] += fake_loss.item()
+                self.total_train_loss["train/discriminator_loss"] += dis_loss.item()
+            else:
+                # for multi-scale discriminator
+                real_loss = 0.0
+                fake_loss = 0.0
+                for i in range(len(p)):
+                    real_loss += self.criterion["mse"](
+                        p[i][-1], p[i][-1].new_ones(p[i][-1].size()))
+                    fake_loss += self.criterion["mse"](
+                        p_[i][-1], p_[i][-1].new_zeros(p_[i][-1].size()))
+                real_loss /= (i + 1)
+                fake_loss /= (i + 1)
+                dis_loss = real_loss + fake_loss
+                self.total_train_loss["train/real_loss"] += real_loss.item()
+                self.total_train_loss["train/fake_loss"] += fake_loss.item()
+                self.total_train_loss["train/discriminator_loss"] += dis_loss.item()
 
             # update discriminator
             self.optimizer["discriminator"].zero_grad()
@@ -227,27 +282,71 @@ class Trainer(object):
         logging.info(f"(Steps: {self.steps}) Finished {self.epochs} epoch training "
                      f"({self.train_steps_per_epoch} steps per epoch).")
 
+    @torch.no_grad()
     def _eval_step(self, batch):
         """Evaluate model one step."""
         # parse batch
-        batch = [b.to(self.device) for b in batch]
-        z, c, y = batch
+        x, y = batch
+        x = tuple([x_.to(self.device) for x_ in x])
+        y = y.to(self.device)
 
-        # calculate generator loss
-        y_ = self.model["generator"](z, c)
+        #######################
+        #      Generator      #
+        #######################
+        y_ = self.model["generator"](*x)
         p_ = self.model["discriminator"](y_)
-        y, y_, p_ = y.squeeze(1), y_.squeeze(1), p_.squeeze(1)
-        adv_loss = self.criterion["mse"](p_, p_.new_ones(p_.size()))
+        y, y_ = y.squeeze(1), y_.squeeze(1)
         sc_loss, mag_loss = self.criterion["stft"](y_, y)
         aux_loss = sc_loss + mag_loss
-        gen_loss = aux_loss + self.config["lambda_adv"] * adv_loss
+        if self.steps > self.config["discriminator_train_start_steps"]:
+            # keep compatibility
+            aux_loss *= self.config.get("lambda_aux_after_introduce_adv_loss", 1.0)
+        if not isinstance(p_, list):
+            # for standard discriminator
+            adv_loss = self.criterion["mse"](p_, p_.new_ones(p_.size()))
+            gen_loss = aux_loss + self.config["lambda_adv"] * adv_loss
+        else:
+            # for multi-scale discriminator
+            adv_loss = 0.0
+            for i in range(len(p_)):
+                adv_loss += self.criterion["mse"](
+                    p_[i][-1], p_[i][-1].new_ones(p_[i][-1].size()))
+            adv_loss /= (i + 1)
+            gen_loss = aux_loss + self.config["lambda_adv"] * adv_loss
 
-        # calculate discriminator loss
-        p = self.model["discriminator"](y.unsqueeze(1)).squeeze(1)
-        p_ = self.model["discriminator"](y_.unsqueeze(1)).squeeze(1)
-        real_loss = self.criterion["mse"](p, p.new_ones(p.size()))
-        fake_loss = self.criterion["mse"](p_, p_.new_zeros(p_.size()))
-        dis_loss = real_loss + fake_loss
+            # feature matching loss
+            if self.config["use_feat_match_loss"]:
+                p = self.model["discriminator"](y.unsqueeze(1))
+                fm_loss = 0.0
+                for i in range(len(p_)):
+                    for j in range(len(p_[i]) - 1):
+                        fm_loss += self.criterion["l1"](p_[i][j], p[i][j])
+                fm_loss /= (i + 1) * (j + 1)
+                self.total_eval_loss["eval/feature_matching_loss"] += fm_loss.item()
+                gen_loss += self.config["lambda_adv"] * self.config["lambda_feat_match"] * fm_loss
+
+        #######################
+        #    Discriminator    #
+        #######################
+        p = self.model["discriminator"](y.unsqueeze(1))
+        p_ = self.model["discriminator"](y_.unsqueeze(1))
+        if not isinstance(p_, list):
+            # for standard discriminator
+            real_loss = self.criterion["mse"](p, p.new_ones(p.size()))
+            fake_loss = self.criterion["mse"](p_, p_.new_zeros(p_.size()))
+            dis_loss = real_loss + fake_loss
+        else:
+            # for multi-scale discriminator
+            real_loss = 0.0
+            fake_loss = 0.0
+            for i in range(len(p)):
+                real_loss += self.criterion["mse"](
+                    p[i][-1], p[i][-1].new_ones(p[i][-1].size()))
+                fake_loss += self.criterion["mse"](
+                    p_[i][-1], p_[i][-1].new_zeros(p_[i][-1].size()))
+            real_loss /= (i + 1)
+            fake_loss /= (i + 1)
+            dis_loss = real_loss + fake_loss
 
         # add to total eval loss
         self.total_eval_loss["eval/adversarial_loss"] += adv_loss.item()
@@ -268,8 +367,7 @@ class Trainer(object):
         # calculate loss for each batch
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.data_loader["dev"], desc="[eval]"), 1):
             # eval one step
-            with torch.no_grad():
-                self._eval_step(batch)
+            self._eval_step(batch)
 
             # save intermediate result
             if eval_steps_per_epoch == 1:
@@ -293,16 +391,17 @@ class Trainer(object):
         for key in self.model.keys():
             self.model[key].train()
 
+    @torch.no_grad()
     def _genearete_and_save_intermediate_result(self, batch):
         """Generate and save intermediate result."""
         # delayed import to avoid error related backend error
         import matplotlib.pyplot as plt
 
         # generate
-        with torch.no_grad():
-            batch = [b.to(self.device) for b in batch]
-            z_batch, c_batch, y_batch = batch
-            y_batch_ = self.model["generator"](z_batch, c_batch)
+        x_batch, y_batch = batch
+        x_batch = tuple([x.to(self.device) for x in x_batch])
+        y_batch = y_batch.to(self.device)
+        y_batch_ = self.model["generator"](*x_batch)
 
         # check directory
         dirname = os.path.join(self.config["outdir"], f"predictions/{self.steps}steps")
@@ -372,7 +471,8 @@ class Collater(object):
     def __init__(self,
                  batch_max_steps=20480,
                  hop_size=256,
-                 aux_context_window=2
+                 aux_context_window=2,
+                 use_noise_input=False,
                  ):
         """Initialize customized collater for PyTorch DataLoader.
 
@@ -380,6 +480,7 @@ class Collater(object):
             batch_max_steps (int): The maximum length of input signal in batch.
             hop_size (int): Hop size of auxiliary features.
             aux_context_window (int): Context window size for auxiliary feature conv.
+            use_noise_input (bool): Whether to use noise input.
 
         """
         if batch_max_steps % hop_size != 0:
@@ -389,6 +490,7 @@ class Collater(object):
         self.batch_max_frames = batch_max_steps // hop_size
         self.hop_size = hop_size
         self.aux_context_window = aux_context_window
+        self.use_noise_input = use_noise_input
 
     def __call__(self, batch):
         """Convert into batch tensors.
@@ -428,9 +530,11 @@ class Collater(object):
         c_batch = torch.FloatTensor(np.array(c_batch)).transpose(2, 1)  # (B, C, T')
 
         # make input noise signal batch tensor
-        z_batch = torch.randn(y_batch.size())  # (B, 1, T)
-
-        return z_batch, c_batch, y_batch
+        if self.use_noise_input:
+            z_batch = torch.randn(y_batch.size())  # (B, 1, T)
+            return (z_batch, c_batch), y_batch
+        else:
+            return (c_batch,), y_batch
 
     @staticmethod
     def _assert_ready_for_upsampling(x, c, hop_size, context_window):
@@ -450,6 +554,8 @@ def main():
                         help="directory to save checkpoints.")
     parser.add_argument("--config", type=str, required=True,
                         help="yaml format configuration file.")
+    parser.add_argument("--pretrain", default="", type=str, nargs="?",
+                        help="checkpoint file path to load pretrained params. (default=\"\")")
     parser.add_argument("--resume", default="", type=str, nargs="?",
                         help="checkpoint file path to resume training. (default=\"\")")
     parser.add_argument("--verbose", type=int, default=1,
@@ -511,7 +617,7 @@ def main():
     # get dataset
     if config["remove_short_samples"]:
         mel_length_threshold = config["batch_max_steps"] // config["hop_size"] + \
-            2 * config["generator_params"]["aux_context_window"]
+            2 * config["generator_params"].get("aux_context_window", 0)
     else:
         mel_length_threshold = None
     if config["format"] == "hdf5":
@@ -532,7 +638,8 @@ def main():
             audio_load_fn=audio_load_fn,
             mel_load_fn=mel_load_fn,
             mel_length_threshold=mel_length_threshold,
-            allow_cache=config.get("allow_cache", False)),  # keep compatibility
+            allow_cache=config.get("allow_cache", False),  # keep compatibility
+        ),
         "dev": AudioMelDataset(
             root_dir=args.dev_dumpdir,
             audio_query=audio_query,
@@ -540,14 +647,19 @@ def main():
             audio_load_fn=audio_load_fn,
             mel_load_fn=mel_load_fn,
             mel_length_threshold=mel_length_threshold,
-            allow_cache=config.get("allow_cache", False)),  # keep compatibility
+            allow_cache=config.get("allow_cache", False),  # keep compatibility
+        ),
     }
 
     # get data loader
     collater = Collater(
         batch_max_steps=config["batch_max_steps"],
         hop_size=config["hop_size"],
-        aux_context_window=config["generator_params"]["aux_context_window"],
+        # keep compatibility
+        aux_context_window=config["generator_params"].get("aux_context_window", 0),
+        # keep compatibility
+        use_noise_input=config.get(
+            "generator_type", "ParallelWaveGANGenerator") != "MelGANGenerator",
     )
     train_sampler, dev_sampler = None, None
     if args.distributed:
@@ -557,12 +669,14 @@ def main():
             dataset=dataset["train"],
             num_replicas=args.world_size,
             rank=args.rank,
-            shuffle=True)
+            shuffle=True,
+        )
         dev_sampler = DistributedSampler(
             dataset=dataset["dev"],
             num_replicas=args.world_size,
             rank=args.rank,
-            shuffle=False)
+            shuffle=False,
+        )
     data_loader = {
         "train": DataLoader(
             dataset=dataset["train"],
@@ -571,7 +685,8 @@ def main():
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
             sampler=train_sampler,
-            pin_memory=config["pin_memory"]),
+            pin_memory=config["pin_memory"],
+        ),
         "dev": DataLoader(
             dataset=dataset["dev"],
             shuffle=False if args.distributed else True,
@@ -579,14 +694,25 @@ def main():
             batch_size=config["batch_size"],
             num_workers=config["num_workers"],
             sampler=dev_sampler,
-            pin_memory=config["pin_memory"]),
+            pin_memory=config["pin_memory"],
+        ),
     }
 
     # define models and optimizers
+    generator_class = getattr(
+        parallel_wavegan.models,
+        # keep compatibility
+        config.get("generator_type", "ParallelWaveGANGenerator"),
+    )
+    discriminator_class = getattr(
+        parallel_wavegan.models,
+        # keep compatibility
+        config.get("discriminator_type", "ParallelWaveGANDiscriminator"),
+    )
     model = {
-        "generator": ParallelWaveGANGenerator(
+        "generator": generator_class(
             **config["generator_params"]).to(device),
-        "discriminator": ParallelWaveGANDiscriminator(
+        "discriminator": discriminator_class(
             **config["discriminator_params"]).to(device),
     }
     criterion = {
@@ -594,6 +720,8 @@ def main():
             **config["stft_loss_params"]).to(device),
         "mse": torch.nn.MSELoss().to(device),
     }
+    if config.get("use_feat_match_loss", False):  # keep compatibility
+        criterion["l1"] = torch.nn.L1Loss().to(device)
     optimizer = {
         "generator": RAdam(
             model["generator"].parameters(),
@@ -633,6 +761,11 @@ def main():
         config=config,
         device=device,
     )
+
+    # load pretrained parameters from checkpoint
+    if len(args.pretrain) != 0:
+        trainer.load_checkpoint(args.pretrain, load_only_params=True)
+        logging.info(f"Successfully load parameters from {args.pretrain}.")
 
     # resume from checkpoint
     if len(args.resume) != 0:

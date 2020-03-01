@@ -1,4 +1,4 @@
-#!/bin/bash -e
+#!/bin/bash
 
 # Copyright 2019 Tomoki Hayashi
 #  MIT License (https://opensource.org/licenses/MIT)
@@ -11,6 +11,8 @@ if [ $# != 1 ]; then
     exit 1
 fi
 
+set -euo pipefail
+
 # download dataset
 cwd=$(pwd)
 if [ ! -e "${download_dir}/CSMSC" ]; then
@@ -19,7 +21,7 @@ if [ ! -e "${download_dir}/CSMSC" ]; then
     wget https://weixinxcxdb.oss-cn-beijing.aliyuncs.com/gwYinPinKu/BZNSYP.rar
     mkdir CSMSC && cd CSMSC && unrar x ../BZNSYP.rar
     # convert new line code
-    find CSMSC/PhoneLabeling -name "*.interval" | while read -r line; do
+    find ./PhoneLabeling -name "*.interval" | while read -r line; do
         nkf -Lu --overwrite "${line}"
     done
     rm ../BZNSYP.rar
