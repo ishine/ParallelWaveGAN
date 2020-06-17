@@ -33,6 +33,8 @@ requirements = {
         "kaldiio>=2.14.1",
         "h5py>=2.10.0",
         "yq>=2.10.0",
+        # Fix No module named "numba.decorators"
+        "numba<=0.48",
     ],
     "setup": [
         "numpy",
