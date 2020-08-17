@@ -2,7 +2,7 @@
 
 ![](https://github.com/kan-bayashi/ParallelWaveGAN/workflows/CI/badge.svg) [![](https://img.shields.io/pypi/v/parallel-wavegan)](https://pypi.org/project/parallel-wavegan/) ![](https://img.shields.io/pypi/pyversions/parallel-wavegan) ![](https://img.shields.io/pypi/l/parallel-wavegan) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/espnet/notebook/blob/master/tts_realtime_demo.ipynb)
 
-This repository provides **UNOFFICIAL** [Parallel WaveGAN](https://arxiv.org/abs/1910.11480), [MelGAN](https://arxiv.org/abs/1910.06711), and [Multi-band MelGAN](https://arxiv.org/abs/2005.05106) implementations with Pytorch.  
+This repository provides **UNOFFICIAL** [PWG](https://arxiv.org/abs/1910.11480), [MelGAN](https://arxiv.org/abs/1910.06711), and [MB-MelGAN](https://arxiv.org/abs/2005.05106) implementations with Pytorch.  
 You can combine these state-of-the-art non-autoregressive models to build your own great vocoder!
 
 Please check our samples in [our demo HP](https://kan-bayashi.github.io/ParallelWaveGAN).
@@ -11,7 +11,8 @@ Please check our samples in [our demo HP](https://kan-bayashi.github.io/Parallel
 
 > Source of the figure: https://arxiv.org/pdf/1910.11480.pdf
 
-The goal of this repository is to provide real-time neural vocoder, which is compatible with [ESPnet-TTS](https://github.com/espnet/espnet).
+The goal of this repository is to provide real-time neural vocoder, which is compatible with [ESPnet-TTS](https://github.com/espnet/espnet).  
+Also, this repository can be combined with [NVIDIA/tacotron2](https://github.com/NVIDIA/tacotron2)-based implementation (See [this comment](https://github.com/kan-bayashi/ParallelWaveGAN/issues/169#issuecomment-649320778)).
 
 You can try the real-time end-to-end text-to-speech demonstration in Google Colab!
 
@@ -178,6 +179,7 @@ You can listen to the samples and download pretrained models from the link to ou
 | [ljspeech_melgan.v3](https://drive.google.com/open?id=1eXkm_Wf1YVlk5waP4Vgqd0GzMaJtW3y5)                    | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/melgan.v3.yaml)                    | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 2000k   |
 | [ljspeech_melgan.v3.long](https://drive.google.com/open?id=1u1w4RPefjByX8nfsL59OzU2KgEksBhL1)               | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/melgan.v3.long.yaml)               | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 4000k   |
 | [ljspeech_full_band_melgan.v1](https://drive.google.com/open?id=1RQqkbnoow0srTDYJNYA7RJ5cDRC5xB-t)          | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/full_band_melgan.v1.yaml)          | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 1000k   |
+| [ljspeech_full_band_melgan.v2](https://drive.google.com/open?id=1d9DWOzwOyxT1K5lPnyMqr2nED62vlHaX)          | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/full_band_melgan.v2.yaml)          | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 1000k   |
 | [ljspeech_multi_band_melgan.v1](https://drive.google.com/open?id=1ls_YxCccQD-v6ADbG6qXlZ8f30KrrhLT)         | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/multi_band_melgan.v1.yaml)         | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 1000k   |
 | [ljspeech_multi_band_melgan.v2](https://drive.google.com/open?id=1wevYP2HQ7ec2fSixTpZIX0sNBtYZJz_I)         | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/ljspeech/voc1/conf/multi_band_melgan.v2.yaml)         | EN    | 22.05k  | 80-7600        | 1024 / 256 / None    | 1000k   |
 | [jsut_parallel_wavegan.v1](https://drive.google.com/open?id=1UDRL0JAovZ8XZhoH0wi9jj_zeCKb-AIA)              | [link](https://github.com/kan-bayashi/ParallelWaveGAN/blob/master/egs/jsut/voc1/conf/parallel_wavegan.v1.yaml)              | JP    | 24k     | 80-7600        | 2048 / 300 / 1200    | 400k    |

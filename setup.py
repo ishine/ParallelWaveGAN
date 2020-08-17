@@ -22,7 +22,7 @@ if LooseVersion(pip.__version__) < LooseVersion("19"):
 
 requirements = {
     "install": [
-        "torch>=1.0.1",
+        "torch>=1.0.1,<=1.5.1",
         "setuptools>=38.5.1",
         "librosa>=0.7.0",
         "soundfile>=0.10.2",
@@ -31,7 +31,7 @@ requirements = {
         "PyYAML>=3.12",
         "tqdm>=4.26.1",
         "kaldiio>=2.14.1",
-        "h5py>=2.10.0",
+        "h5py>=2.9.0",
         "yq>=2.10.0",
         # Fix No module named "numba.decorators"
         "numba<=0.48",
@@ -65,7 +65,7 @@ extras_require = {k: v for k, v in requirements.items()
 
 dirname = os.path.dirname(__file__)
 setup(name="parallel_wavegan",
-      version="0.4.0",
+      version="0.4.3",
       url="http://github.com/kan-bayashi/ParallelWaveGAN",
       author="Tomoki Hayashi",
       author_email="hayashi.tomoki@g.sp.m.is.nagoya-u.ac.jp",
