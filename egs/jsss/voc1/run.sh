@@ -7,7 +7,7 @@
 . ./path.sh || exit 1;
 
 # basic settings
-stage=0        # stage to start
+stage=-1       # stage to start
 stop_stage=100 # stage to stop
 verbose=1      # verbosity level (lower is less info)
 n_gpus=1       # number of gpus in training
@@ -17,26 +17,13 @@ n_jobs=4       # number of parallel jobs in feature extraction
 conf=conf/parallel_wavegan.v1.yaml
 
 # directory path setting
-db_root=/path/to/database # direcotry including spk name directory (MODIFY BY YOURSELF)
-                          # e.g.
-                          # /path/to/database
-                          # ├── spk_1
-                          # │   ├── utt1.wav
-                          # ├── spk_2
-                          # │   ├── utt1.wav
-                          # │   ...
-                          # └── spk_N
-                          #     ├── utt1.wav
-                          #     ...
+download_dir=downloads # direcotry to save downloaded files
 dumpdir=dump # directory to dump features
 
 # subset setting
-spks="all"    # speaker name to be used (e.g. "spk1 spk2")
-              # it must be matched the name under the ${db_root}
-              # if set to "all", all of the speakers in ${db_root} will be used
 shuffle=false # whether to shuffle the data to create subset
-num_dev=10    # the number of development data for each speaker
-num_eval=10   # the number of evaluation data for each speaker
+num_dev=50    # the number of development data
+num_eval=50   # the number of evaluation data
               # (if set to 0, the same dev set is used as eval set)
 
 # training related setting
@@ -54,41 +41,28 @@ checkpoint="" # checkpoint path to be used for decoding
 # shellcheck disable=SC1091
 . utils/parse_options.sh || exit 1;
 
-train_set="train_nodev_$(echo "${spks}" | tr " " "_")" # name of training data directory
-dev_set="dev_$(echo "${spks}" | tr " " "_")"           # name of development data directory
-eval_set="eval_$(echo "${spks}" | tr " " "_")"         # name of evaluation data directory
+train_set="train_nodev" # name of training data directory
+dev_set="dev"           # name of development data direcotry
+eval_set="eval"         # name of evaluation data direcotry
 
 set -euo pipefail
 
+if [ "${stage}" -le -1 ] && [ "${stop_stage}" -ge -1 ]; then
+    echo "Stage -1: Data download"
+    local/data_download.sh "${download_dir}"
+fi
+
 if [ "${stage}" -le 0 ] && [ "${stop_stage}" -ge 0 ]; then
     echo "Stage 0: Data preparation"
-    train_data_dirs=""
-    dev_data_dirs=""
-    eval_data_dirs=""
-    if [ "${spks}" = "all" ]; then
-        spks=$(find "${db_root}" -maxdepth 1 ! -path "${db_root}" \
-            -follow -type d -print0 -name "[^.]*" | xargs -0 -I{} basename {})
-    fi
-    for spk in ${spks}; do
-        local/data_prep.sh \
-            --fs "$(yq ".sampling_rate" "${conf}")" \
-            --shuffle "${shuffle}" \
-            --num_dev "${num_dev}" \
-            --num_eval "${num_eval}" \
-            --train_set "train_nodev_${spk}" \
-            --dev_set "dev_${spk}" \
-            --eval_set "eval_${spk}" \
-            "${db_root}" "${spk}" data
-        train_data_dirs+=" data/train_nodev_${spk}"
-        dev_data_dirs+=" data/dev_${spk}"
-        eval_data_dirs+=" data/eval_${spk}"
-    done
-    # shellcheck disable=SC2086
-    utils/combine_data.sh "data/${train_set}" ${train_data_dirs}
-    # shellcheck disable=SC2086
-    utils/combine_data.sh "data/${dev_set}" ${dev_data_dirs}
-    # shellcheck disable=SC2086
-    utils/combine_data.sh "data/${eval_set}" ${eval_data_dirs}
+    local/data_prep.sh \
+        --fs "$(yq ".sampling_rate" "${conf}")" \
+        --num_dev "${num_dev}" \
+        --num_eval "${num_eval}" \
+        --train_set "${train_set}" \
+        --dev_set "${dev_set}" \
+        --eval_set "${eval_set}" \
+        --shuffle "${shuffle}" \
+        "${download_dir}/jsss_ver1" data
 fi
 
 stats_ext=$(grep -q "hdf5" <(yq ".format" "${conf}") && echo "h5" || echo "npy")
@@ -154,13 +128,13 @@ if [ "${stage}" -le 1 ] && [ "${stop_stage}" -ge 1 ]; then
 fi
 
 if [ -z "${tag}" ]; then
-    expdir="exp/${train_set}_$(basename "${conf}" .yaml)"
+    expdir="exp/${train_set}_jsss_$(basename "${conf}" .yaml)"
     if [ -n "${pretrain}" ]; then
         pretrain_tag=$(basename "$(dirname "${pretrain}")")
         expdir+="_${pretrain_tag}"
     fi
 else
-    expdir="exp/${train_set}_${tag}"
+    expdir="exp/${train_set}_jsss_${tag}"
 fi
 if [ "${stage}" -le 2 ] && [ "${stop_stage}" -ge 2 ]; then
     echo "Stage 2: Network training"
